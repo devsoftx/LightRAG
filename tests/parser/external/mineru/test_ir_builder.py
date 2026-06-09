@@ -559,24 +559,175 @@ def test_adapter_missing_content_list_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.offline
-def test_adapter_html_table_fallback(tmp_path: Path) -> None:
-    """If table_body is a string that is not JSON, treat as HTML and keep
-    on IRTable.html so the writer emits format="html"."""
+def test_adapter_html_table_preserves_merged_cells_and_extracts_thead(
+    tmp_path: Path,
+) -> None:
+    """MinerU HTML table_body must stay HTML so rowspan/colspan survive."""
+    table_html = (
+        '<table><thead><tr><th rowspan="2">Metric</th>'
+        '<th colspan="2">Group</th></tr><tr><th>A</th><th>B</th></tr></thead>'
+        "<tbody><tr><td>Accuracy</td><td>91%</td><td>93%</td></tr></tbody></table>"
+    )
     raw = _write_bundle(
         tmp_path,
         [
             {
                 "type": "table",
-                "table_body": "<table><tr><td>a</td></tr></table>",
+                "table_body": table_html,
+                "table_caption": ["Tbl"],
+            }
+        ],
+    )
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="h.pdf")
+    table = ir.blocks[0].tables[0]
+
+    assert table.rows is None
+    assert table.html == table_html
+    assert 'rowspan="2"' in table.html
+    assert 'colspan="2"' in table.html
+    assert table.body_override == table_html.removeprefix("<table>").removesuffix(
+        "</table>"
+    )
+    assert table.num_rows == 3
+    assert table.num_cols == 3
+    assert table.caption == "Tbl"
+    # The <thead> is preserved verbatim (raw HTML) so rowspan/colspan survive —
+    # not flattened into a grid.
+    assert table.table_header == (
+        '<thead><tr><th rowspan="2">Metric</th>'
+        '<th colspan="2">Group</th></tr><tr><th>A</th><th>B</th></tr></thead>'
+    )
+    assert 'rowspan="2"' in table.table_header
+    assert 'colspan="2"' in table.table_header
+
+
+@pytest.mark.offline
+def test_adapter_html_table_header_preserves_spans(tmp_path: Path) -> None:
+    """A spanned <thead> is stored verbatim — colspan/rowspan markup is kept
+    intact rather than flattened into a rectangular grid (so merged-cell
+    semantics survive into every repeated header chunk downstream)."""
+    thead = (
+        "<thead>"
+        '<tr><th>ID</th><th colspan="3">Scores</th></tr>'
+        '<tr><th>n</th><th>A</th><th colspan="2">BC</th></tr>'
+        "</thead>"
+    )
+    table_html = (
+        f"<table>{thead}<tbody>"
+        "<tr><td>1</td><td>x</td><td>y</td><td>z</td></tr>"
+        "</tbody></table>"
+    )
+    raw = _write_bundle(tmp_path, [{"type": "table", "table_body": table_html}])
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="h.pdf")
+    table = ir.blocks[0].tables[0]
+    assert table.num_cols == 4
+    assert table.table_header == thead
+    assert table.table_header.count('colspan="3"') == 1
+    assert table.table_header.count('colspan="2"') == 1
+
+
+@pytest.mark.offline
+def test_adapter_html_table_without_thead_does_not_guess_header(
+    tmp_path: Path,
+) -> None:
+    """Only a real HTML <thead> should populate table_header."""
+    table_html = (
+        "<table><tbody><tr><td>H1</td><td>H2</td></tr>"
+        "<tr><td>a</td><td>b</td></tr></tbody></table>"
+    )
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {
+                "type": "table",
+                "table_body": table_html,
                 "num_rows": 1,
-                "num_cols": 1,
+                "num_cols": 2,
             }
         ],
     )
     ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="h.pdf")
     table = ir.blocks[0].tables[0]
     assert table.rows is None
-    assert table.html and "<td>a</td>" in table.html
+    assert table.html == table_html
+    assert table.table_header is None
+
+
+@pytest.mark.offline
+def test_adapter_html_table_without_thead_falls_back_to_header_grid(
+    tmp_path: Path,
+) -> None:
+    """An HTML table whose markup carries no <thead> but for which MinerU
+    supplied a separate ``header`` grid keeps that grid (the writer renders it to
+    a span-less <thead>) rather than silently dropping the recovered header."""
+    table_html = (
+        "<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>"  # no <thead>
+    )
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {
+                "type": "table",
+                "table_body": table_html,
+                "header": [["H1", "H2"]],
+                "num_rows": 1,
+                "num_cols": 2,
+            }
+        ],
+    )
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="h.pdf")
+    table = ir.blocks[0].tables[0]
+    assert table.html == table_html
+    assert table.table_header == [["H1", "H2"]]  # grid kept, not dropped
+
+
+@pytest.mark.offline
+def test_adapter_html_table_attr_with_gt_keeps_inner_body(tmp_path: Path) -> None:
+    """A ``>`` inside a ``<table>`` attribute must not truncate the open tag,
+    so ``body_override`` still strips the full ``<table …>`` wrapper."""
+    table_html = '<table data-x="a>b"><tbody><tr><td>v</td></tr></tbody></table>'
+    raw = _write_bundle(
+        tmp_path,
+        [{"type": "table", "table_body": table_html}],
+    )
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="h.pdf")
+    table = ir.blocks[0].tables[0]
+    assert table.html == table_html
+    assert table.body_override == "<tbody><tr><td>v</td></tr></tbody>"
+
+
+@pytest.mark.offline
+def test_adapter_empty_html_table_falls_back_to_full_html(tmp_path: Path) -> None:
+    """A degenerate ``<table></table>`` has no inner body, so ``body_override``
+    stays None and the writer renders ``table.html`` verbatim."""
+    raw = _write_bundle(
+        tmp_path,
+        [{"type": "table", "table_body": "<table></table>"}],
+    )
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="h.pdf")
+    table = ir.blocks[0].tables[0]
+    assert table.html == "<table></table>"
+    assert table.body_override is None
+
+
+@pytest.mark.offline
+def test_adapter_html_table_strips_html_body_wrapper(tmp_path: Path) -> None:
+    """MinerU's table model may wrap output in ``<html><body>``; the adapter
+    must unwrap to a single ``<table>`` so the writer does not nest tables and
+    ``TABLE_TAG_RE`` consumers are not truncated at the inner ``</table>``."""
+    inner = (
+        '<thead><tr><th colspan="2">G</th></tr></thead>'
+        "<tbody><tr><td>a</td><td>b</td></tr></tbody>"
+    )
+    payload = f"<html><body><table>{inner}</table></body></html>"
+    raw = _write_bundle(tmp_path, [{"type": "table", "table_body": payload}])
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="h.pdf")
+    table = ir.blocks[0].tables[0]
+    assert table.html == f"<table>{inner}</table>"  # <html>/<body> wrapper gone
+    assert table.body_override == inner  # block text renders only the inner body
+    assert table.num_cols == 2
+    # The <thead> is kept verbatim (colspan preserved), not flattened to a grid.
+    assert table.table_header == '<thead><tr><th colspan="2">G</th></tr></thead>'
 
 
 @pytest.mark.offline

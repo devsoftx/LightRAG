@@ -16,6 +16,11 @@ DEFAULT_MAX_GRAPH_NODES = 1000
 DEFAULT_SUMMARY_LANGUAGE = "English"  # Default language for document processing
 DEFAULT_MAX_GLEANING = 1
 DEFAULT_ENTITY_NAME_MAX_LENGTH = 256
+# Max UTF-8 byte length for entity identifiers. Milvus enforces VARCHAR
+# max_length in BYTES (not characters), so a CJK name within the character
+# limit can still exceed the field limit. MUST stay <= the max_length of the
+# entity_name / src_id / tgt_id fields in lightrag/kg/milvus_impl.py.
+DEFAULT_ENTITY_NAME_MAX_BYTES = 512
 
 # Per-response output limits for entity extraction prompts
 DEFAULT_MAX_EXTRACTION_RECORDS = 100
@@ -31,6 +36,15 @@ DEFAULT_SUMMARY_LENGTH_RECOMMENDED = 600
 DEFAULT_SUMMARY_CONTEXT_SIZE = 12000
 # Maximum token size allowed for entity extraction input context
 DEFAULT_MAX_EXTRACT_INPUT_TOKENS = 20480
+# Maximum token size for the per-chunk `---Section Context---` heading
+# breadcrumb injected into the extraction prompt. Keeps section metadata from
+# pushing an otherwise-valid chunk past the provider context window; over budget
+# the breadcrumb collapses to ``first → … → leaf`` (top-level + nearest section).
+DEFAULT_MAX_SECTION_CONTEXT_TOKENS = 256
+# Per-level character cap for each heading in that breadcrumb. Must stay below
+# 1/3 of DEFAULT_MAX_SECTION_CONTEXT_TOKENS so the collapsed two-level form
+# (first + leaf, plus separator/ellipsis) always fits within the token budget.
+DEFAULT_HEADING_LEVEL_MAX_CHARS = 80
 # Separator for: description, source_id and relation-key fields(Can not be changed after data inserted)
 GRAPH_FIELD_SEP = "<SEP>"
 
@@ -49,20 +63,20 @@ DEFAULT_MIN_RERANK_SCORE = 0.0
 DEFAULT_RERANK_BINDING = "null"
 
 # Default source ids limit in meta data for entity and relation
-DEFAULT_MAX_SOURCE_IDS_PER_ENTITY = 300
-DEFAULT_MAX_SOURCE_IDS_PER_RELATION = 300
+DEFAULT_MAX_SOURCE_IDS_PER_ENTITY = 200
+DEFAULT_MAX_SOURCE_IDS_PER_RELATION = 200
 ### control chunk_ids limitation method: FIFO, FIFO
 ###    FIFO: First in first out
 ###    KEEP: Keep oldest (less merge action and faster)
 SOURCE_IDS_LIMIT_METHOD_KEEP = "KEEP"
 SOURCE_IDS_LIMIT_METHOD_FIFO = "FIFO"
-DEFAULT_SOURCE_IDS_LIMIT_METHOD = SOURCE_IDS_LIMIT_METHOD_FIFO
+DEFAULT_SOURCE_IDS_LIMIT_METHOD = SOURCE_IDS_LIMIT_METHOD_KEEP
 VALID_SOURCE_IDS_LIMIT_METHODS = {
     SOURCE_IDS_LIMIT_METHOD_KEEP,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
 }
 # Maximum number of file paths stored in entity/relation file_path field (For displayed only, does not affect query performance)
-DEFAULT_MAX_FILE_PATHS = 100
+DEFAULT_MAX_FILE_PATHS = 75
 
 # Field length of file_path in Milvus Schema for entity and relation (Should not be changed)
 # file_path must store all file paths up to the DEFAULT_MAX_FILE_PATHS limit within the metadata.
@@ -75,7 +89,7 @@ DEFAULT_TEMPERATURE = 1.0
 
 # Async configuration defaults
 DEFAULT_MAX_ASYNC = 4  # Default maximum async operations
-DEFAULT_MAX_PARALLEL_INSERT = 2  # Default maximum parallel insert operations
+DEFAULT_MAX_PARALLEL_INSERT = 3  # Default maximum parallel insert operations
 
 # Chunker defaults — i18n-aware so Chinese / mixed-language documents
 # split correctly out of the box.  Override per deployment via
@@ -277,17 +291,40 @@ SUPPORTED_PROCESS_OPTIONS = frozenset(
 
 DEFAULT_MAX_PARALLEL_ANALYZE = 5  # Multimodal analysis (VLM) concurrency
 
-# Per-engine parsing concurrency defaults.  mineru / docling default to 1
-# because both engines are resource-intensive (GPU/CPU + memory) and tend to
-# be more stable when run serially; users with capacity can opt into higher
-# concurrency via MAX_PARALLEL_PARSE_* env vars.
+# Per-engine parsing concurrency defaults.  mineru / docling are
+# resource-intensive (GPU/CPU + memory), so they default to a modest amount of
+# parallelism (2); lower to 1 when resources are tight, or raise via the
+# MAX_PARALLEL_PARSE_* env vars when you have spare capacity.
 DEFAULT_MAX_PARALLEL_PARSE_NATIVE = 5
-DEFAULT_MAX_PARALLEL_PARSE_MINERU = 1
-DEFAULT_MAX_PARALLEL_PARSE_DOCLING = 1
+DEFAULT_MAX_PARALLEL_PARSE_MINERU = 2
+DEFAULT_MAX_PARALLEL_PARSE_DOCLING = 2
 
 # Staged pipeline queue size defaults.
-DEFAULT_QUEUE_SIZE_DEFAULT = 100
+DEFAULT_QUEUE_SIZE_PARSE = 20
+DEFAULT_QUEUE_SIZE_ANALYZE = 100
 DEFAULT_QUEUE_SIZE_INSERT = 4
+
+# LLM / embedding call priority levels.  Lower values run first
+# (asyncio.PriorityQueue semantics); priority only orders calls *within* a
+# single role queue (extract / keyword / query / vlm).  These name the values
+# passed as the ``_priority`` argument to the priority_limit_async_func_call
+# wrapper, centralizing the magic numbers that were previously inlined at each
+# call site.
+#
+# Query stage (interactive: query/keyword LLM calls and query-time embeddings)
+# gets the highest priority so user requests stay responsive.
+DEFAULT_QUERY_PRIORITY = 5
+# Entity/relation description summary generation — ahead of raw extraction but
+# behind interactive query work.
+DEFAULT_SUMMARY_PRIORITY = 8
+# Processing stage entity/relation extraction (ingestion).  Also the wrapper's
+# baseline default for any call that does not pass ``_priority``.
+DEFAULT_PROCESSING_PRIORITY = 10
+# Priority used for all multimodal analysis LLM calls.  Set equal to
+# DEFAULT_PROCESSING_PRIORITY so analysis and ingestion work share the EXTRACT
+# queue fairly and advance evenly — otherwise a busy ingestion queue starves
+# analysis tasks, stalling analysis nodes and dragging down overall throughput.
+DEFAULT_MM_ANALYSIS_PRIORITY = DEFAULT_PROCESSING_PRIORITY
 
 # Multimodal analysis / chunk thresholds
 # Minimum token count retained when truncating a multimodal chunk's
@@ -298,11 +335,7 @@ DEFAULT_MM_CHUNK_DESCRIPTION_MIN_TOKENS = 100
 # Minimum image side (width or height) in pixels accepted for VLM analysis.
 # Anything smaller is treated as decorative (icons, separators, etc.) and
 # written as status="skipped".
-DEFAULT_MM_IMAGE_MIN_PIXEL = 32
-# Priority used for all multimodal analysis LLM calls.  Higher numbers run
-# behind entity extraction (priority 10) so a busy ingestion queue still
-# prefers KG-building work.
-DEFAULT_MM_ANALYSIS_PRIORITY = 12
+DEFAULT_MM_IMAGE_MIN_PIXEL = 64
 
 # Embedding configuration defaults
 DEFAULT_EMBEDDING_FUNC_MAX_ASYNC = 8  # Default max async for embedding functions
@@ -316,7 +349,7 @@ DEFAULT_LLM_TIMEOUT = 180
 DEFAULT_EMBEDDING_TIMEOUT = 30
 
 # Rerank async / timeout defaults
-# Concurrency falls back to base MAX_ASYNC when env unset; timeout has its own
+# Concurrency falls back to base MAX_ASYNC_LLM when env unset; timeout has its own
 # default since reranker calls are typically much faster than full LLM generation.
 DEFAULT_RERANK_MAX_ASYNC = DEFAULT_MAX_ASYNC
 DEFAULT_RERANK_TIMEOUT = 30

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from lightrag.file_atomic import atomic_write, reap_orphan_tmp_files
 from lightrag.utils import logger, compute_mdhash_id
 from lightrag.base import BaseVectorStorage
+from lightrag.constants import DEFAULT_QUERY_PRIORITY
 
 from .shared_storage import (
     get_namespace_lock,
@@ -394,7 +395,7 @@ class FaissVectorDBStorage(BaseVectorStorage):
             embedding = np.array([query_embedding], dtype=np.float32)
         else:
             embedding = await self.embedding_func(
-                [query], context="query", _priority=5
+                [query], context="query", _priority=DEFAULT_QUERY_PRIORITY
             )  # higher priority for query
             # embedding is shape (1, dim)
             embedding = np.array(embedding, dtype=np.float32)
@@ -890,6 +891,32 @@ class FaissVectorDBStorage(BaseVectorStorage):
             logger.warning(f"[{self.workspace}] Starting with an empty Faiss index.")
             self._index = faiss.IndexFlatIP(self._dim)
             self._id_to_meta = {}
+
+    async def drop_pending_index_ops(self) -> None:
+        """Discard buffered upserts on an aborting batch.
+
+        Only the pending buffer is dropped; vectors already materialized into
+        ``self._index`` by a prior ``_flush_pending_locked`` whose save step
+        then failed (``_index_dirty=True``) are intentionally NOT rolled back.
+
+        The pipeline treats each file as an atomic unit: an abort marks the
+        affected documents FAILED and the whole file is reprocessed on the
+        next run. Because upserts are keyed by deterministic ids (entity-name
+        / relation / chunk hashes), reprocessing overwrites those vectors
+        idempotently, so the final state is identical whether or not we roll
+        back here. This matches the server-backed backends (Milvus / OpenSearch
+        / Postgres / Mongo / Qdrant), which likewise keep a sibling flush's
+        already-committed partial data on abort rather than rolling it back;
+        and if the process crashes before the next save, these in-memory
+        writes are dropped anyway. Rolling back only FAISS/Nano would add an
+        inconsistent, non-load-bearing "FAILED == clean" guarantee, so it is
+        deliberately omitted.
+        """
+        if self._storage_lock is None:
+            self._pending_upserts.clear()
+            return
+        async with self._storage_lock:
+            self._pending_upserts.clear()
 
     async def index_done_callback(self) -> bool:
         """Flush deferred embeddings, commit to disk, and notify other processes.

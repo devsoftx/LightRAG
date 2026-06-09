@@ -24,6 +24,7 @@ from lxml import etree
 
 from lightrag.parser.docx import parse_document as parse_doc
 from lightrag.parser.docx.parse_document import (
+    DocxContentError,
     extract_docx_blocks,
     extract_paragraph_content,
 )
@@ -230,6 +231,92 @@ def test_heading_markdown_prefix_capped_at_six(tmp_path) -> None:
     ]
 
 
+def _add_outline_para_with_softbreak(doc, head_text: str, body_text: str, level: int):
+    """Append one ``<w:p>`` carrying an outline level whose runs are
+    ``head_text`` + a soft line break (``<w:br/>``) + ``body_text``.
+
+    Mirrors the real-world WPS/Word pattern where an author sets an outline
+    level on a paragraph but types the body with Shift+Enter (a soft break)
+    instead of a new paragraph, so heading + body live in a single paragraph.
+    """
+    para = doc.add_paragraph(head_text)
+    pPr = para._p.get_or_add_pPr()
+    outline = OxmlElement("w:outlineLvl")
+    outline.set(qn("w:val"), str(level - 1))
+    pPr.append(outline)
+    para.add_run().add_break()  # default WD_BREAK.LINE → soft <w:br/> → '\n'
+    para.add_run(body_text)
+    return para
+
+
+@pytest.mark.offline
+def test_oversize_outline_heading_with_softbreak_splits(tmp_path) -> None:
+    """An over-long heading paragraph that contains a soft break must split:
+    the first line stays the heading, the remainder becomes body text. No
+    DocxContentError, and the body content is preserved in full."""
+    head = "A、处置程序"
+    body = "施工现场一旦发生事故时应立即采取相应的应急处置措施并以最快速度报警。" * 8
+    assert len(head) + 1 + len(body) > 200  # would trip validate_heading_length
+
+    doc = Document()
+    _add_outline_para_with_softbreak(doc, head, body, level=4)
+
+    buf = BytesIO()
+    doc.save(buf)
+    docx_path = tmp_path / "softbreak.docx"
+    docx_path.write_bytes(buf.getvalue())
+
+    blocks = extract_docx_blocks(str(docx_path), fixlevel=0)
+
+    # The short first line becomes the heading; the long remainder is body.
+    heading_block = next(b for b in blocks if b["heading"] == head)
+    assert body in heading_block["content"]
+    # Heading field carries only the first line, not the body.
+    assert body not in heading_block["heading"]
+
+
+@pytest.mark.offline
+def test_oversize_outline_heading_no_softbreak_demoted_to_body(tmp_path) -> None:
+    """A single-line over-long outline paragraph (no soft break) is demoted to
+    body text rather than raising — content preserved, not treated as a heading."""
+    long_text = "施工现场应急处置措施说明，" * 30  # well over 200 chars, no '\n'
+    assert len(long_text) > 200
+
+    doc = Document()
+    _add_heading(doc, long_text, level=2)
+
+    buf = BytesIO()
+    doc.save(buf)
+    docx_path = tmp_path / "demote.docx"
+    docx_path.write_bytes(buf.getvalue())
+
+    blocks = extract_docx_blocks(str(docx_path), fixlevel=0)
+
+    # The text survives as body content, and no block adopts it as a heading.
+    assert any(long_text in b["content"] for b in blocks)
+    assert all(b["heading"] != long_text for b in blocks)
+
+
+@pytest.mark.offline
+def test_short_outline_paragraph_still_heading(tmp_path) -> None:
+    """A within-limit outline paragraph must still be recognized as a heading —
+    the over-long handling never demotes short headings."""
+    doc = Document()
+    _add_heading(doc, "处置程序", level=3)
+    doc.add_paragraph("body under heading.")
+
+    buf = BytesIO()
+    doc.save(buf)
+    docx_path = tmp_path / "short.docx"
+    docx_path.write_bytes(buf.getvalue())
+
+    blocks = extract_docx_blocks(str(docx_path), fixlevel=0)
+
+    heading_block = next(b for b in blocks if b["heading"] == "处置程序")
+    assert heading_block["level"] == 3
+    assert heading_block["content"].startswith("### 处置程序")
+
+
 @pytest.mark.offline
 def test_existing_markdown_heading_keeps_content_but_metadata_is_clean(
     tmp_path,
@@ -293,3 +380,54 @@ def test_empty_tables_are_skipped(tmp_path) -> None:
         "must be dropped before the placeholder is emitted"
     )
     assert any('"A"' in b["content"] and '"B"' in b["content"] for b in blocks)
+
+
+# --- invalid (non-ZIP) .docx files surface an accurate error ---------------
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize(
+    ("header", "format_hint"),
+    [
+        (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"junk", "Word 97-2003"),
+        (b"{\\rtf1\\ansi}", "RTF"),
+        (b"%PDF-1.7\n%binary", "PDF"),
+        (b"<?xml version='1.0'?><html></html>", "HTML or XML"),
+        (b"plain text masquerading as docx", "not a valid DOCX"),
+    ],
+)
+def test_invalid_docx_raises_accurate_error(tmp_path, header, format_hint) -> None:
+    """A file that exists but is not a ZIP/OOXML package must fail with an
+    accurate message — never the misleading python-docx "Package not found".
+
+    The native worker confirms the file exists before parsing, so the only way
+    ``PackageNotFoundError`` can fire here is a corrupt file or a non-DOCX
+    payload wearing a .docx extension. The error must name the real format and
+    keep the file path.
+    """
+    docx_path = tmp_path / "masquerade.docx"
+    docx_path.write_bytes(header)
+
+    with pytest.raises(DocxContentError) as excinfo:
+        extract_docx_blocks(str(docx_path), fixlevel=0)
+
+    message = str(excinfo.value)
+    assert "Package not found" not in message
+    assert "valid DOCX" in message
+    assert str(docx_path) in message
+    assert format_hint in message
+
+
+@pytest.mark.offline
+def test_empty_docx_file_reports_truncation(tmp_path) -> None:
+    """A 0-byte .docx must be diagnosed as empty/truncated, not 'not found'."""
+    docx_path = tmp_path / "empty.docx"
+    docx_path.write_bytes(b"")
+
+    with pytest.raises(DocxContentError) as excinfo:
+        extract_docx_blocks(str(docx_path), fixlevel=0)
+
+    message = str(excinfo.value)
+    assert "Package not found" not in message
+    assert "empty" in message
+    assert str(docx_path) in message

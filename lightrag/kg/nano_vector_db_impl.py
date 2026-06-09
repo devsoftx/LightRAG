@@ -14,6 +14,7 @@ from lightrag.utils import (
 )
 
 from lightrag.base import BaseVectorStorage
+from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from nano_vectordb import NanoVectorDB
 from .shared_storage import (
     get_namespace_lock,
@@ -423,7 +424,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
         else:
             # Execute embedding outside of lock to avoid improve cocurrent
             embedding = await self.embedding_func(
-                [query], context="query", _priority=5
+                [query], context="query", _priority=DEFAULT_QUERY_PRIORITY
             )  # higher priority for query
             embedding = embedding[0]
 
@@ -628,6 +629,32 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 f"[{self.workspace}] Error deleting relations for {entity_name}: {e}"
             )
             raise
+
+    async def drop_pending_index_ops(self) -> None:
+        """Discard buffered upserts on an aborting batch.
+
+        Only the pending buffer is dropped; records already materialized into
+        ``self._client`` by a prior ``_flush_pending_locked`` whose save step
+        then failed (``_client_dirty=True``) are intentionally NOT rolled back.
+
+        The pipeline treats each file as an atomic unit: an abort marks the
+        affected documents FAILED and the whole file is reprocessed on the
+        next run. Because upserts are keyed by deterministic ids (entity-name
+        / relation / chunk hashes), reprocessing overwrites those vectors
+        idempotently, so the final state is identical whether or not we roll
+        back here. This matches the server-backed backends (Milvus / OpenSearch
+        / Postgres / Mongo / Qdrant), which likewise keep a sibling flush's
+        already-committed partial data on abort rather than rolling it back;
+        and if the process crashes before the next save, these in-memory
+        writes are dropped anyway. Rolling back only FAISS/Nano would add an
+        inconsistent, non-load-bearing "FAILED == clean" guarantee, so it is
+        deliberately omitted.
+        """
+        if self._storage_lock is None:
+            self._pending_upserts.clear()
+            return
+        async with self._storage_lock:
+            self._pending_upserts.clear()
 
     async def index_done_callback(self) -> bool:
         """Flush deferred embeddings, commit to disk, and notify other processes.

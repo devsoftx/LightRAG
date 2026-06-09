@@ -138,15 +138,15 @@ MinerU 客户端支持两种模式，二选一：
 - `local`：自建 MinerU 服务（推荐用官方 Docker Compose 部署），LightRAG 通过 HTTP 调用本地容器。
 - `official`：直连 MinerU 官方精准 API v4，需要在 [mineru.net](https://mineru.net) 申请 token。
 
-**本地化部署（Docker Compose）**
+**使用 Docker Compose 本地部署**
 
-从 [opendatalab/MinerU](https://github.com/opendatalab/MinerU) 克隆官方仓库到本地，进入仓库内的 docker 部署目录后，先构建镜像：
+从 Github官方仓库   [opendatalab/MinerU](https://github.com/opendatalab/MinerU) 把 Dockerfile 和 compose.yaml 拷贝到本地。这两个文件应该在仓库的 docker 目录可以找到。然后通过以下命令构建 docker 镜像:
 
 ```bash
-docker compose -f compose.yaml build
+docker build --tag mineru:latest .
 ```
 
-然后启动 API 服务（带 `--profile api` 才会启用 HTTP API 容器，默认监听 8000 端口）：
+镜像构建好之后通过以下命令启动 API 服务（带 `--profile api` 才会启用 HTTP API 容器，默认监听 8000 端口）：
 
 ```bash
 docker compose -f compose.yaml --profile api up -d
@@ -323,7 +323,7 @@ DOCLING_DO_FORMULA_ENRICHMENT=true
 - F/R/V/P至多出现一个；同一选项重复时只生效一次但不报错。
 - 大小写敏感：分块选项 F/R/V/P必须大写；其它选项 i/t/e小写。
 - 中括号内出现非法字符时，整个 hint 失效，引擎按默认规则解析，选项按 `LIGHTRAG_PARSER` 默认或全部默认；同时落日志 warning。
-- `P` 仅对 `native` 抽取出的 LightRAG Document 结构化结果有效；对 `legacy` 路径或非结构化输出会自动降级到 `R` 并记录 warning。
+- `P` 对任何能产出 `.blocks.jsonl` sidecar 的引擎（`native` / `mineru` / `docling`）抽取出的结构化结果有效；对 `legacy` 路径或无 sidecar 的输出会自动降级到 `R` 并记录 warning。
 
 ## 三、分块器参数配置（chunk_options）
 
@@ -721,26 +721,27 @@ PENDING ─►├─ q_mineru  ──► [mineru parser  × N2] ─┼─► q_a
 | 环境变量 | 默认值 | 作用 | 调优建议 |
 | --- | --- | --- | --- |
 | `MAX_PARALLEL_PARSE_NATIVE` | `5` | N1: native 解析（docx / pdf / txt 等纯本地处理）并发 worker 数 | 纯 CPU、内存占用低，可按 CPU 核数提高 |
-| `MAX_PARALLEL_PARSE_MINERU` | `1` | N2: MinerU 解析并发 worker 数 | MinerU 占用 GPU/CPU 显著，**默认串行最稳**。本地部署且显存充足时可设 2-3；走 MinerU 官方云端服务时可适当提高（受云端配额限制） |
-| `MAX_PARALLEL_PARSE_DOCLING` | `1` | N3: Docling 解析并发 worker 数 | Docling 同样资源敏感，**默认串行最稳**。本地部署且 CPU/GPU 充足时可设 2-3 |
+| `MAX_PARALLEL_PARSE_MINERU` | `2` | N2: MinerU 解析并发 worker 数 | MinerU 占用 GPU/CPU 显著，**默认 2 为适度并发**。资源紧张时可降到 1；本地部署且显存充足时可设 2-3；走 MinerU 官方云端服务时可适当提高（受云端配额限制） |
+| `MAX_PARALLEL_PARSE_DOCLING` | `2` | N3: Docling 解析并发 worker 数 | Docling 同样资源敏感，**默认 2 为适度并发**。资源紧张时可降到 1；本地部署且 CPU/GPU 充足时可设 2-3 |
 | `MAX_PARALLEL_ANALYZE` | `5` | N4: 多模态分析（VLM 图片 / 表格描述）并发 worker 数 | 直接消耗 VLM 配额。建议 ≤ VLM 服务并发上限 |
-| `MAX_PARALLEL_INSERT` | `2` | N5: 实体 / 关系抽取 + 入库阶段并发文档数 | 推荐 `MAX_ASYNC / 3`，区间 2~10。该阶段每个文档会触发多次 LLM 调用，过高会撞 LLM 限流。同时该值还作为 `asyncio.Semaphore` 用于二次约束（worker 数和信号量值一致） |
-| `QUEUE_SIZE_DEFAULT` | `100` | parse / analyze 阶段间的有界队列容量 | 一般无需调整。极少量大批量任务（成千上万）可适当提高，避免 enqueue 端反压；内存紧张时可调低 |
+| `MAX_PARALLEL_INSERT` | `3` | N5: 实体 / 关系抽取 + 入库阶段并发文档数 | 推荐 `MAX_ASYNC_LLM / 3`，区间 2~10。该阶段每个文档会触发多次 LLM 调用，过高会撞 LLM 限流。同时该值还作为 `asyncio.Semaphore` 用于二次约束（worker 数和信号量值一致） |
+| `QUEUE_SIZE_PARSE` | `20` | parse（native/MinerU/Docling）输入队列长度 | 一般无需调整。队列内仅为轻量 doc_id（大文档体在进入 analyze 前已剥离），仅限制 pipeline 一次预派发给 parse worker 的待处理文档数，调整影响很小 |
+| `QUEUE_SIZE_ANALYZE` | `100` | analyze 队列（parse → analyze 阶段）的有界容量 | 一般无需调整。极少量大批量任务（成千上万）可适当提高，避免 enqueue 端反压；内存紧张时可调低 |
 | `QUEUE_SIZE_INSERT` | `4` | analyze → process 阶段间的队列容量 | process 是流水线中最慢、最耗内存的阶段，队列特意做小，给上游提供反压防止内存堆积 |
 
 **几个要点：**
 
 1. **解析阶段按引擎隔离**，所以混用 native/mineru/docling 时不必担心一种引擎慢拖累另一种。
-2. **mineru / docling 默认串行（=1）**：实测两者资源占用高，并行收益不稳定（容易 OOM / 显存竞争 / 失败重试）。如果你部署了多 GPU 或专门的解析服务器，可手动调高。
+2. **mineru / docling 默认 2**：两者资源占用高，默认保持适度并发。资源紧张时可降到 1（避免 OOM / 显存竞争 / 失败重试）；如果你部署了多 GPU 或专门的解析服务器，可手动调高。
 3. **`MAX_PARALLEL_INSERT` 兼任 worker 池大小和信号量上限**：流水线创建 `Semaphore(max_parallel_insert)`，每个 process worker 在抽取入库前还要拿一次信号量。所以哪怕你把 worker 数手动改大，实际并发上限仍由这个值决定——直接调它就够了。
 4. **queue size 与背压**：`QUEUE_SIZE_INSERT=4` 这个偏小的默认值是有意为之——process 阶段慢且占内存，让 analyze 阶段在队列写满时阻塞、再反压到 parse 阶段，避免一次性把成千上万份解析结果堆在内存里。
 5. **改后生效方式**：所有参数通过 `.env`（或环境变量）传入，仅在 `LightRAG` 实例构造时读取一次；改完需要重启服务。
 
 **典型调优场景：**
 
-- 大量 PDF + 本地 MinerU 单 GPU：`MAX_PARALLEL_PARSE_MINERU=1`、`MAX_PARALLEL_ANALYZE=5`、`MAX_PARALLEL_INSERT=2`（默认即可）。
+- 大量 PDF + 本地 MinerU 单 GPU：`MAX_PARALLEL_PARSE_MINERU=2`、`MAX_PARALLEL_ANALYZE=5`、`MAX_PARALLEL_INSERT=3`（默认即可；显存紧张时把 MINERU 降到 1）。
 - 大量 PDF + MinerU 云端服务：`MAX_PARALLEL_PARSE_MINERU=3~5`（视云端配额），其它保持默认。
-- 纯 docx / txt（仅走 native）：`MAX_PARALLEL_PARSE_NATIVE=10`、`MAX_PARALLEL_INSERT` 按 `MAX_ASYNC/3` 推算。
+- 纯 docx / txt（仅走 native）：`MAX_PARALLEL_PARSE_NATIVE=10`、`MAX_PARALLEL_INSERT` 按 `MAX_ASYNC_LLM/3` 推算。
 - LLM 限流明显：先降 `MAX_PARALLEL_INSERT`（process 阶段每文档多次 LLM 调用），再降 `MAX_PARALLEL_ANALYZE`（VLM 是独立配额）。
 
 ## 七、流水线启动时的续跑规则
