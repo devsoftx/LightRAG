@@ -167,10 +167,51 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
     """Reject insecure JWT auth settings before the API starts."""
     auth_accounts = (getattr(args, "auth_accounts", "") or "").strip()
     token_secret = (getattr(args, "token_secret", "") or "").strip()
+    sso_enabled = bool(getattr(args, "sso_enabled", False))
 
-    if auth_accounts and (not token_secret or token_secret == DEFAULT_TOKEN_SECRET):
+    # Any profile that actually authenticates users signs its sessions with this
+    # secret. DEFAULT_TOKEN_SECRET is a public constant in this file, so leaving
+    # it in place would let anyone forge a session token -- the login mechanism
+    # in front of it (password or SSO) becomes decorative. SSO is included here
+    # for exactly the same reason AUTH_ACCOUNTS is: it mints real user sessions.
+    if (auth_accounts or sso_enabled) and (
+        not token_secret or token_secret == DEFAULT_TOKEN_SECRET
+    ):
+        trigger = "AUTH_ACCOUNTS is configured" if auth_accounts else "SSO_ENABLED=true"
         raise ValueError(
-            "TOKEN_SECRET must be explicitly set to a non-default value when AUTH_ACCOUNTS is configured."
+            f"TOKEN_SECRET must be explicitly set to a non-default value when {trigger}."
+        )
+
+    if not sso_enabled:
+        return
+
+    # Fail fast on an SSO profile that cannot possibly complete a login, rather
+    # than surfacing it as a confusing redirect error on the first sign-in.
+    missing = [
+        name
+        for name, value in (
+            ("SSO_CLIENT_ID", getattr(args, "sso_client_id", None)),
+            ("SSO_CLIENT_SECRET", getattr(args, "sso_client_secret", None)),
+            ("SSO_REDIRECT_URI", getattr(args, "sso_redirect_uri", None)),
+        )
+        if not (value or "").strip()
+    ]
+    if missing:
+        raise ValueError(
+            "SSO_ENABLED=true requires " + ", ".join(missing) + " to be set."
+        )
+
+    redirect_uri = (getattr(args, "sso_redirect_uri", "") or "").strip()
+    if not redirect_uri.startswith(
+        ("http://localhost", "http://127.0.0.1", "https://")
+    ):
+        # The authorization code is delivered to this URI. Over plaintext HTTP it
+        # is exposed to any network observer, who can then redeem it. Loopback is
+        # exempt because it never leaves the machine and is the documented
+        # development flow.
+        raise ValueError(
+            "SSO_REDIRECT_URI must use https:// (loopback http:// is allowed for "
+            f"local development). Got: {redirect_uri}"
         )
 
 
@@ -832,6 +873,36 @@ def parse_args() -> argparse.Namespace:
     args.login_lockout_window_seconds = get_env_value(
         "LOGIN_LOCKOUT_WINDOW_SECONDS", 300, float
     )
+
+    # Single sign-on (OIDC authorization code + PKCE). Every value is read from
+    # the environment / .env so a deployment switches identity providers without
+    # touching code. ``SSO_PROVIDER`` names an entry in the provider registry
+    # (built-in ``entra``, or a third party registered through the
+    # ``lightrag.sso_providers`` entry point group).
+    #
+    # SSO_ENABLED gates the whole subsystem: when false nothing is imported, no
+    # route is mounted, and authentication behaves exactly as it did before.
+    args.sso_enabled = get_env_value("SSO_ENABLED", False, bool)
+    args.sso_provider = get_env_value("SSO_PROVIDER", "entra")
+    args.sso_tenant_id = get_env_value("SSO_TENANT_ID", None)
+    args.sso_client_id = get_env_value("SSO_CLIENT_ID", None)
+    args.sso_client_secret = get_env_value("SSO_CLIENT_SECRET", None)
+    args.sso_redirect_uri = get_env_value("SSO_REDIRECT_URI", None)
+    args.sso_scopes = get_env_value("SSO_SCOPES", "openid,profile,email")
+    # Comma-separated group object IDs. When set, a user must hold at least one
+    # of them or the login is refused -- authorization, distinct from the
+    # authentication that Entra performed.
+    args.sso_allowed_groups = get_env_value("SSO_ALLOWED_GROUPS", "")
+    # Comma-separated ``<group-oid>:<role>`` pairs. Unmatched users fall back to
+    # SSO_DEFAULT_ROLE.
+    args.sso_role_mapping = get_env_value("SSO_ROLE_MAPPING", "")
+    args.sso_default_role = get_env_value("SSO_DEFAULT_ROLE", "user")
+    args.sso_session_ttl_hours = get_env_value("SSO_SESSION_TTL_HOURS", 8, float)
+    # Lifetime of the one-time login transaction (state/nonce/PKCE verifier)
+    # held between /auth/sso/login and /auth/sso/callback.
+    args.sso_state_ttl_seconds = get_env_value("SSO_STATE_TTL_SECONDS", 600, float)
+    # Where the browser lands after a successful callback.
+    args.sso_post_login_redirect = get_env_value("SSO_POST_LOGIN_REDIRECT", "/webui/")
 
     # Rerank model configuration
     args.rerank_model = get_env_value("RERANK_MODEL", None)

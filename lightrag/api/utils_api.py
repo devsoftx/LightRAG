@@ -241,6 +241,17 @@ def check_env_file():
 # Get whitelist paths from global_args, only once during initialization
 whitelist_paths = global_args.whitelist_paths.split(",")
 
+# The SSO entry and callback must be reachable by a caller who has no session
+# yet -- that is the whole point of them -- so they are always whitelisted when
+# SSO is enabled, rather than relying on the operator to remember to add them to
+# WHITELIST_PATHS. Neither grants anything on its own: /login only issues a
+# redirect, and /callback mints a session only after lightrag.api.sso.core has
+# fully verified an id_token (signature, issuer, audience, expiry, nonce).
+if getattr(global_args, "sso_enabled", False):
+    from lightrag.api.sso.routes import sso_whitelist_paths
+
+    whitelist_paths.extend(sso_whitelist_paths())
+
 # Pre-compile path matching patterns
 whitelist_patterns: List[Tuple[str, bool]] = []
 for path in whitelist_paths:
@@ -253,8 +264,18 @@ for path in whitelist_paths:
         else:
             whitelist_patterns.append((path, False))  # (exact_path, is_prefix_match)
 
-# Global authentication configuration
-auth_configured = bool(auth_handler.accounts)
+# Global authentication configuration.
+#
+# SSO counts as configured authentication for exactly the same reason
+# AUTH_ACCOUNTS does: it mints real, non-guest user sessions. Leaving it out
+# would be a fail-open bypass rather than a cosmetic omission -- with
+# SSO_ENABLED=true and no AUTH_ACCOUNTS this flag would be False, and
+# ``is_authenticated_request`` below returns True unconditionally when neither
+# auth nor an API key is configured. Every protected route would then be open
+# to anonymous callers on a server whose operator had just enabled SSO.
+auth_configured = bool(auth_handler.accounts) or bool(
+    getattr(global_args, "sso_enabled", False)
+)
 
 
 def get_route_path(scope: Mapping[str, Any], mount_prefix: str = "") -> str:

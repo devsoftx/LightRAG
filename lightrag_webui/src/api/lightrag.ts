@@ -326,6 +326,14 @@ export type AuthStatusResponse = {
   api_version?: string
   webui_title?: string
   webui_description?: string
+  // Single sign-on. Only the entry URL is exposed -- never tenant or client id,
+  // since /auth-status is unauthenticated by design.
+  sso_enabled?: boolean
+  sso_login_url?: string | null
+  sso_provider?: string | null
+  // False when SSO is the only configured mechanism, so the login form can be
+  // hidden rather than offering a sign-in that cannot succeed.
+  password_login_enabled?: boolean
 }
 
 export type PipelineStatusResponse = {

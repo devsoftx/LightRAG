@@ -61,6 +61,9 @@ from lightrag.api.routers.document_routes import (
 )
 from lightrag.parser.docx.smart_heading.nlp import SmartHeadingNLPError
 from lightrag.parser.plugins import load_third_party_parsers
+from lightrag.api.sso.plugins import load_sso_providers
+from lightrag.api.sso.registry import get_provider, get_spec, supported_providers
+from lightrag.api.sso.routes import SSO_LOGIN_PATH, create_sso_router
 from lightrag.parser.routing import (
     parser_rules_from_env,
     validate_parser_routing_config,
@@ -96,8 +99,12 @@ load_dotenv(dotenv_path=".env", override=False)
 webui_title = os.getenv("WEBUI_TITLE")
 webui_description = os.getenv("WEBUI_DESCRIPTION")
 
-# Global authentication configuration
-auth_configured = bool(auth_handler.accounts)
+# Global authentication configuration. Mirrors utils_api.auth_configured --
+# SSO mints real user sessions, so a server with SSO_ENABLED=true is
+# authenticated even when AUTH_ACCOUNTS is empty. See the comment there.
+auth_configured = bool(auth_handler.accounts) or bool(
+    getattr(global_args, "sso_enabled", False)
+)
 
 
 def _inject_swagger_theme(html: str, theme: str) -> str:
@@ -1323,6 +1330,33 @@ def create_app(args):
     # BEFORE validating routing rules, so LIGHTRAG_PARSER may reference them.
     load_third_party_parsers()
     validate_parser_routing_config()
+
+    # Resolve the SSO profile before anything else touches authentication.
+    # Discovery runs BEFORE the provider is looked up so SSO_PROVIDER may name a
+    # third-party provider, mirroring how parser plugins load before
+    # LIGHTRAG_PARSER is validated. Unlike the parser loader this one raises:
+    # a server told to use SSO must never start without it (see
+    # lightrag.api.sso.plugins).
+    sso_enabled = bool(getattr(args, "sso_enabled", False))
+    if sso_enabled:
+        load_sso_providers()
+        spec = get_spec(args.sso_provider)
+        if spec is None:
+            raise ValueError(
+                f"SSO_PROVIDER={args.sso_provider!r} is not a known provider. "
+                f"Available: {', '.join(supported_providers())}"
+            )
+        missing_env = [name for name in spec.required_env if not os.getenv(name)]
+        if missing_env:
+            raise ValueError(
+                f"SSO provider {spec.name!r} requires: {', '.join(missing_env)}"
+            )
+        # Instantiate now so an unimportable provider fails at startup rather
+        # than on a user's first sign-in.
+        get_provider(spec.name)
+        logger.info(
+            "[sso] provider %r ready (%s)", spec.name, spec.description or spec.impl
+        )
     # Fail fast when DOCX_SMART_HEADING / a LIGHTRAG_PARSER rule enables
     # smart_heading but the pinned spaCy models are missing — surfacing the
     # install step at startup instead of failing mid-pipeline. Runs in
@@ -2440,7 +2474,12 @@ def create_app(args):
     async def get_auth_status():
         """Get authentication status and guest token if auth is not configured"""
 
-        if not auth_handler.accounts:
+        # ``auth_configured`` (module level) is True when AUTH_ACCOUNTS *or* SSO
+        # is configured. Guest tokens must only ever be issued in the genuinely
+        # unauthenticated profile: they are signed with DEFAULT_TOKEN_SECRET, a
+        # public constant, so handing one out on an SSO deployment would let any
+        # caller forge a session and bypass the identity provider entirely.
+        if not auth_configured:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(
                 username="guest", role="guest", metadata={"auth_mode": "disabled"}
@@ -2455,6 +2494,7 @@ def create_app(args):
                 "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                "sso_enabled": False,
             }
 
         return {
@@ -2464,6 +2504,16 @@ def create_app(args):
             "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
+            # Drives the "Sign in with <provider>" button. Only the entry URL is
+            # exposed -- never tenant, client id or any other SSO_* value, since
+            # this endpoint is unauthenticated by design.
+            "sso_enabled": sso_enabled,
+            "sso_login_url": SSO_LOGIN_PATH if sso_enabled else None,
+            "sso_provider": args.sso_provider if sso_enabled else None,
+            # False when SSO is the only configured mechanism, so the WebUI can
+            # hide the username/password form instead of offering a login that
+            # cannot succeed.
+            "password_login_enabled": bool(auth_handler.accounts),
         }
 
     # Brute-force protection for /login (CWE-307): throttle failed attempts per
@@ -2476,8 +2526,30 @@ def create_app(args):
         window_seconds=getattr(args, "login_lockout_window_seconds", 300.0),
     )
 
+    # Single sign-on routes, mounted only when SSO_ENABLED is true so a
+    # deployment that does not use SSO exposes no additional surface. Registered
+    # here rather than beside the other routers so the SSO callback can share
+    # this limiter -- the callback does network and public-key work per request
+    # and needs the same brute-force ceiling as /login.
+    if sso_enabled:
+        app.include_router(
+            create_sso_router(args, auth_handler, login_rate_limiter=login_rate_limiter)
+        )
+
     @app.post("/login")
     async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+        if auth_configured and not auth_handler.accounts:
+            # SSO-only profile: there are no local passwords to check, and the
+            # guest-token branch below must not run (see /auth-status). Reject
+            # rather than fall through, so an unauthenticated caller cannot
+            # obtain a session from this endpoint.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Password login is disabled on this server. "
+                    f"Sign in via {SSO_LOGIN_PATH}."
+                ),
+            )
         if not auth_handler.accounts:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(

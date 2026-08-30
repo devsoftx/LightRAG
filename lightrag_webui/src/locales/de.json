@@ -31,7 +31,9 @@
     "errorEmptyFields": "Bitte geben Sie Ihren Benutzernamen und Ihr Passwort ein",
     "errorInvalidCredentials": "Anmeldung fehlgeschlagen, bitte überprüfen Sie Benutzername und Passwort",
     "authDisabled": "Authentifizierung ist deaktiviert. Verwenden des anmeldefreien Modus.",
-    "guestMode": "Anmeldefrei"
+    "guestMode": "Anmeldefrei",
+    "ssoButton": "Mit Microsoft anmelden",
+    "or": "oder"
   },
   "common": {
     "cancel": "Abbrechen",
