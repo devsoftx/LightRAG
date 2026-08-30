@@ -40,7 +40,11 @@ class _FakeResponse:
         return None
 
     async def aiter_lines(self):
-        for line in [json.dumps({"response": "one"}), "", json.dumps({"response": "two"})]:
+        for line in [
+            json.dumps({"response": "one"}),
+            "",
+            json.dumps({"response": "two"}),
+        ]:
             yield line
 
 

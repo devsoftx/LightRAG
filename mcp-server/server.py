@@ -18,9 +18,7 @@ class LightRAGAPIClient:
     """Small HTTP client for the LightRAG query endpoints."""
 
     def __init__(self) -> None:
-        base_url = os.getenv("LIGHTRAG_API_URL", "http://localhost:9621").rstrip(
-            "/"
-        )
+        base_url = os.getenv("LIGHTRAG_API_URL", "http://localhost:9621").rstrip("/")
         self.base_url = f"{base_url}/"
         self.timeout = float(os.getenv("LIGHTRAG_API_TIMEOUT", "150"))
 
