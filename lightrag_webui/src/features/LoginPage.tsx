@@ -44,20 +44,36 @@ const LoginPage = () => {
         // token stays out of access logs and Referer headers. Consume it before
         // anything else, then strip it from the address bar so a copied URL
         // cannot leak a live session.
-        if (window.location.hash) {
-          const fragment = new URLSearchParams(window.location.hash.slice(1))
-          const ssoToken = fragment.get('access_token')
+        //
+        // The app runs HashRouter, which owns the fragment and parses it as a
+        // route, so the callback nests the token in the query of the /login
+        // hash route: "#/login?access_token=...". Read that query rather than
+        // treating the whole fragment as parameters.
+        const hash = window.location.hash
+        const queryStart = hash.indexOf('?')
+        if (queryStart !== -1) {
+          const hashParams = new URLSearchParams(hash.slice(queryStart + 1))
+          const ssoToken = hashParams.get('access_token')
           if (ssoToken) {
-            window.history.replaceState(
-              null, '', window.location.pathname + window.location.search
-            )
             login(ssoToken, false, null, null, null, null)
-            navigate('/')
+            // replace:true swaps the token-bearing history entry for "#/", so
+            // the token is gone from both the address bar and the back stack.
+            // Done through the router (not history.replaceState) so the router
+            // observes the change -- a manual replaceState is invisible to it
+            // and left the app convinced it was still on /login.
+            navigate('/', { replace: true })
             return
+          }
+          const hashError = hashParams.get('sso_error')
+          if (hashError) {
+            toast.error(hashError)
+            window.history.replaceState(
+              null, '', window.location.pathname + window.location.search + '#/login'
+            )
           }
         }
 
-        // Errors come back from the callback as ?sso_error=...
+        // Errors can also arrive as a normal query string.
         const ssoError = new URLSearchParams(window.location.search).get('sso_error')
         if (ssoError) {
           toast.error(ssoError)

@@ -51,8 +51,17 @@ const AppContent = () => {
 
   // Redirect effect for protected routes
   useEffect(() => {
-    if (!initializing && !isAuthenticated) {
-      const currentPath = window.location.hash.slice(1);
+    // Read the store LIVE rather than trusting the value closed over by this
+    // effect. LoginPage authenticates and navigates in the same tick, and this
+    // effect can then run against a stale isAuthenticated=false while the
+    // location has already moved to "/", bouncing a freshly signed-in user
+    // straight back to /login. getState() is always current.
+    if (!initializing && !isAuthenticated && !useAuthStore.getState().isAuthenticated) {
+      // Compare the PATH only. The hash can legitimately carry a query --
+      // the SSO callback returns the session as "#/login?access_token=..." --
+      // and comparing the raw hash would fail the equality check, redirect to
+      // a bare "/login", and discard the token before LoginPage could read it.
+      const currentPath = window.location.hash.slice(1).split('?')[0];
       if (currentPath !== '/login') {
         console.log('Not authenticated, redirecting to login');
         navigate('/login');

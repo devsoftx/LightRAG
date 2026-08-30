@@ -59,10 +59,13 @@ def create_sso_router(args, auth_handler, *, login_rate_limiter=None) -> APIRout
     )
 
     def _failure_redirect(message: str) -> RedirectResponse:
-        # Errors go back to the login page as a query parameter rather than a
-        # raw 4xx body, so a browser mid-redirect lands somewhere usable.
+        # Errors go back to the login page rather than a raw 4xx body, so a
+        # browser mid-redirect lands somewhere usable. Uses the same
+        # "#/login?..." hash-route shape as the success path, so the WebUI's
+        # HashRouter reaches LoginPage instead of parsing the parameters as a
+        # route name.
         return RedirectResponse(
-            url=f"/webui/?{urlencode({'sso_error': message})}", status_code=303
+            url=f"/webui/#/login?{urlencode({'sso_error': message})}", status_code=303
         )
 
     @router.get(SSO_LOGIN_PATH, include_in_schema=False)
@@ -135,12 +138,21 @@ def create_sso_router(args, auth_handler, *, login_rate_limiter=None) -> APIRout
         logger.info("[sso] sign-in succeeded for %r role=%s", identity.username, role)
 
         destination = return_to or settings.post_login_redirect
-        # The token rides in the fragment: fragments are not sent to servers and
-        # do not appear in access logs or Referer headers, unlike a query string.
-        # The WebUI reads it on load and moves it into localStorage, matching how
-        # the password flow already stores its token.
+        # The token rides in the URL fragment: fragments are never sent to a
+        # server, so it stays out of access logs and Referer headers -- unlike a
+        # query string. The WebUI reads it on load and moves it into
+        # localStorage, matching how the password flow already stores its token.
+        #
+        # The shape is "#/login?access_token=..." rather than a bare
+        # "#access_token=..." because the WebUI runs react-router's HashRouter,
+        # which owns the fragment: it parses everything after '#' as a route. A
+        # bare token fragment is read as the route "/access_token=..." , matches
+        # nothing, and is silently discarded. Nesting the token in the query of
+        # the "/login" hash route keeps the fragment valid for the router while
+        # preserving the never-sent-to-a-server property.
+        params = urlencode({"access_token": token, "token_type": "bearer"})
         return RedirectResponse(
-            url=f"{destination}#{urlencode({'access_token': token, 'token_type': 'bearer'})}",
+            url=f"{destination}#/login?{params}",
             status_code=303,
         )
 
