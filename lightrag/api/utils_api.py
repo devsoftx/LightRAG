@@ -21,6 +21,7 @@ from fastapi import HTTPException, Security, Request, Response, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
 from ..utils import safe_log_value
+from ..security_context import set_user_groups
 from .auth import auth_handler
 from .config import (
     ollama_server_infos,
@@ -354,6 +355,30 @@ def path_is_whitelisted(scope: Mapping[str, Any], *, mount_prefix: str = "") -> 
     return False
 
 
+def _groups_from_token(token_info: Mapping[str, Any]) -> tuple[str, ...]:
+    """Extract the caller's group set from a validated session token.
+
+    Returns an empty tuple when the token carries no groups -- a password-auth
+    account, or an SSO login from a directory that emits no group claim. That is
+    an authenticated caller who belongs to nothing, which is distinct from *no
+    identity at all*; see :mod:`lightrag.security_context`.
+
+    The token has already passed signature validation, so its metadata is
+    trusted here. Non-string and blank entries are dropped anyway: the value
+    reaches a PostgreSQL array literal, and a malformed element would corrupt
+    it rather than merely being ignored.
+    """
+    metadata = token_info.get("metadata") or {}
+    if not isinstance(metadata, Mapping):
+        return ()
+    raw = metadata.get("groups") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(g for g in raw if isinstance(g, str) and g.strip())
+
+
 def credentials_accepted(
     *,
     token: Optional[str],
@@ -472,6 +497,18 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     # not authenticate anything.
                 elif auth_configured and token_info.get("role") != "guest":
                     # Accept non-guest token if password auth is configured
+                    #
+                    # Publish the caller's group set for the storage layer, which
+                    # cannot reach the request. Set only on this accepting exit,
+                    # never before the authorization decision: a request that is
+                    # about to be rejected must not leave an identity behind for
+                    # whatever runs next on this task.
+                    #
+                    # FastAPI resolves dependencies in the same task as the
+                    # endpoint, so the value is visible for the whole request and
+                    # dies with the task. Deliberately not reset here -- an
+                    # explicit reset would unbind it before the endpoint runs.
+                    set_user_groups(_groups_from_token(token_info))
                     _renew_token_if_needed(path, response, token_info)
                     return
                 else:

@@ -8,6 +8,9 @@ import datetime
 from datetime import timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, ClassVar, Sequence, TypeVar, Union, final
+
+from lightrag.security_context import get_user_groups, to_pg_text_array
+
 import numpy as np
 import configparser
 import ssl
@@ -450,6 +453,24 @@ class PostgreSQLDB:
         # Statement LRU cache size (keep as-is, allow None for optional configuration)
         self.statement_cache_size = config.get("statement_cache_size")
 
+        # Row-Level Security. Off by default: enabling it changes read paths to
+        # require an authenticated identity, so it must be an explicit operator
+        # decision made together with creating the policies in the database.
+        # Turning this on without the policies costs a transaction per read and
+        # filters nothing; creating the policies without turning it on makes
+        # every read return zero rows.
+        self.rls_enabled = os.environ.get(
+            "POSTGRES_RLS_ENABLED", ""
+        ).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        # Applied inside the RLS transaction only. RLS predicates add per-tuple
+        # work to vector scans; empty means "leave the server default alone".
+        self.rls_work_mem = os.environ.get("POSTGRES_RLS_WORK_MEM", "").strip() or None
+
         if self.user is None or self.password is None or self.database is None:
             raise ValueError("Missing database user, password, or database")
 
@@ -773,6 +794,7 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
         timing_label: str | None = None,
+        rls_context: bool = False,
     ) -> T:
         """
         Execute a database operation with automatic retry for transient failures.
@@ -780,6 +802,13 @@ class PostgreSQLDB:
         Args:
             operation: Async callable that receives an active connection.
             with_age: Whether to configure Apache AGE on the connection.
+            rls_context: Bind the caller's identity to the session before running
+                ``operation``, so PostgreSQL Row-Level Security policies can
+                evaluate it. Defaults to False, which leaves every existing call
+                site byte-for-byte unchanged; ingestion and maintenance paths run
+                under a BYPASSRLS role and must stay on that path. Has no effect
+                unless ``POSTGRES_RLS_ENABLED`` is set. See
+                :meth:`_run_with_rls_context`.
             graph_name: AGE graph name; required when with_age is True.
 
         Returns:
@@ -830,7 +859,67 @@ class PostgreSQLDB:
                         await self.configure_age(connection, graph_name)
                     elif with_age and not graph_name:
                         raise ValueError("Graph name is required when with_age is True")
+                    if rls_context and self.rls_enabled:
+                        return await self._run_with_rls_context(connection, operation)
                     return await operation(connection)
+
+    async def _run_with_rls_context(
+        self,
+        connection: asyncpg.Connection,
+        operation: Callable[[asyncpg.Connection], Awaitable[T]],
+    ) -> T:
+        """Run ``operation`` with the caller's identity bound to the session.
+
+        The transaction is load-bearing, not incidental. LightRAG's read path
+        normally runs on a bare pooled connection (``db.query`` calls
+        ``connection.fetch`` directly), and on a bare connection:
+
+        - ``SET LOCAL`` is a no-op. PostgreSQL accepts it, warns, and discards
+          the value because it is scoped to a transaction that does not exist.
+          The RLS policy would then read an empty group set and match nothing --
+          failing closed, but indistinguishable from "RLS is broken".
+        - plain ``SET`` applies but persists for the lifetime of the pooled
+          connection, so the next checkout inherits the previous caller's
+          groups. Correctness would rest entirely on the pool's reset callback
+          firing, and that callback's own docstring warns that skipping it
+          "leaks session state across pool checkouts".
+
+        Opening a transaction makes the setting both effective and
+        self-unwinding: it is discarded at commit, so a recycled connection can
+        never carry one caller's entitlements into another's request. Security
+        stops depending on the reset callback.
+        """
+        groups = get_user_groups()
+        if groups is None:
+            # No identity was established for this task. Refuse rather than run:
+            # an unscoped query would silently return every row, which is the
+            # one failure mode invisible in the results. Distinct from an
+            # authenticated caller with zero groups, which proceeds and simply
+            # matches little.
+            raise PermissionError(
+                "RLS-scoped database operation attempted with no identity in "
+                "context. This is a bug in the calling path, not a permission "
+                "denial: see lightrag.security_context."
+            )
+
+        async with connection.transaction():
+            # Bound as a parameter, never interpolated. set_config(..., true) is
+            # the function form of SET LOCAL and accepts a bind parameter; group
+            # names come from an external directory, so a display name holding a
+            # quote is enough to corrupt an interpolated literal.
+            await connection.execute(
+                "SELECT set_config('app.current_user_groups', $1, true)",
+                to_pg_text_array(groups),
+            )
+            if self.rls_work_mem:
+                # Per-connection GUC, so it must be set inside this same
+                # transaction to unwind with it. RLS predicates add per-tuple
+                # work to vector scans; without headroom the sort spills to
+                # disk.
+                await connection.execute(
+                    "SELECT set_config('work_mem', $1, true)", self.rls_work_mem
+                )
+            return await operation(connection)
 
     def _get_pool_snapshot(self) -> str:
         """Best-effort snapshot of asyncpg pool state for diagnostics.

@@ -133,6 +133,17 @@ def create_sso_router(args, auth_handler, *, login_rate_limiter=None) -> APIRout
                 "auth_mode": "sso",
                 "sso_provider": settings.provider,
                 "sso_subject": identity.subject,
+                # Carried so the storage layer can scope Row-Level Security to
+                # this caller without a second directory lookup per request.
+                # These are the groups the identity provider asserted and the
+                # core already authorized against SSO_ALLOWED_GROUPS -- they are
+                # transported, never re-derived from anything client-supplied.
+                #
+                # The session token is signed, so a caller cannot edit them. It
+                # is NOT encrypted, so anyone holding the token can read their
+                # own group names; that is the same exposure as the id_token
+                # they just completed a login with.
+                "groups": list(identity.groups),
             },
         )
         logger.info("[sso] sign-in succeeded for %r role=%s", identity.username, role)
