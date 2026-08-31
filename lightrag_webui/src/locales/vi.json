@@ -31,7 +31,9 @@
     "errorEmptyFields": "Vui lòng nhập tên người dùng và mật khẩu",
     "errorInvalidCredentials": "Đăng nhập thất bại, vui lòng kiểm tra tên người dùng và mật khẩu",
     "authDisabled": "Xác thực bị tắt. Đang sử dụng chế độ không cần đăng nhập.",
-    "guestMode": "Không cần đăng nhập"
+    "guestMode": "Không cần đăng nhập",
+    "ssoButton": "Đăng nhập bằng Microsoft",
+    "or": "hoặc"
   },
   "common": {
     "cancel": "Hủy",

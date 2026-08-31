@@ -19,6 +19,9 @@ const LoginPage = () => {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [checkingAuth, setCheckingAuth] = useState(true)
+  const [ssoEnabled, setSsoEnabled] = useState(false)
+  const [ssoLoginUrl, setSsoLoginUrl] = useState<string | null>(null)
+  const [passwordLoginEnabled, setPasswordLoginEnabled] = useState(true)
   const authCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
 
   useEffect(() => {
@@ -36,6 +39,47 @@ const LoginPage = () => {
       authCheckRef.current = true;
 
       try {
+        // The SSO callback hands the session back in the URL fragment rather
+        // than a query string: fragments are never sent to a server, so the
+        // token stays out of access logs and Referer headers. Consume it before
+        // anything else, then strip it from the address bar so a copied URL
+        // cannot leak a live session.
+        //
+        // The app runs HashRouter, which owns the fragment and parses it as a
+        // route, so the callback nests the token in the query of the /login
+        // hash route: "#/login?access_token=...". Read that query rather than
+        // treating the whole fragment as parameters.
+        const hash = window.location.hash
+        const queryStart = hash.indexOf('?')
+        if (queryStart !== -1) {
+          const hashParams = new URLSearchParams(hash.slice(queryStart + 1))
+          const ssoToken = hashParams.get('access_token')
+          if (ssoToken) {
+            login(ssoToken, false, null, null, null, null)
+            // replace:true swaps the token-bearing history entry for "#/", so
+            // the token is gone from both the address bar and the back stack.
+            // Done through the router (not history.replaceState) so the router
+            // observes the change -- a manual replaceState is invisible to it
+            // and left the app convinced it was still on /login.
+            navigate('/', { replace: true })
+            return
+          }
+          const hashError = hashParams.get('sso_error')
+          if (hashError) {
+            toast.error(hashError)
+            window.history.replaceState(
+              null, '', window.location.pathname + window.location.search + '#/login'
+            )
+          }
+        }
+
+        // Errors can also arrive as a normal query string.
+        const ssoError = new URLSearchParams(window.location.search).get('sso_error')
+        if (ssoError) {
+          toast.error(ssoError)
+          window.history.replaceState(null, '', window.location.pathname)
+        }
+
         // If already authenticated, redirect to home
         if (isAuthenticated) {
           navigate('/')
@@ -59,6 +103,12 @@ const LoginPage = () => {
           navigate('/')
           return
         }
+
+        setSsoEnabled(Boolean(status.sso_enabled))
+        setSsoLoginUrl(status.sso_login_url ?? null)
+        // Absent means a server that predates SSO, where password login is the
+        // only option -- so default to true rather than hiding the form.
+        setPasswordLoginEnabled(status.password_login_enabled !== false)
 
         // Only set checkingAuth to false if we need to show the login page
         setCheckingAuth(false);
@@ -165,42 +215,66 @@ const LoginPage = () => {
           </div>
         </CardHeader>
         <CardContent className="px-8 pb-8">
-          <form onSubmit={handleSubmit} className="space-y-6">
-            <div className="flex items-center gap-4">
-              <label htmlFor="username-input" className="text-sm font-medium w-16 shrink-0">
-                {t('login.username')}
-              </label>
-              <Input
-                id="username-input"
-                placeholder={t('login.usernamePlaceholder')}
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                required
-                className="h-11 flex-1"
-              />
+          {ssoEnabled && ssoLoginUrl && (
+            <div className="mb-6 space-y-6">
+              {/* A plain link, not a fetch: the identity provider redirect is a
+                  full browser navigation and must leave the SPA. */}
+              <Button
+                type="button"
+                className="w-full h-11 text-base font-medium"
+                onClick={() => { window.location.href = ssoLoginUrl }}
+              >
+                {t('login.ssoButton')}
+              </Button>
+              {passwordLoginEnabled && (
+                <div className="flex items-center gap-3">
+                  <span className="h-px flex-1 bg-border" />
+                  <span className="text-muted-foreground text-xs uppercase">
+                    {t('login.or')}
+                  </span>
+                  <span className="h-px flex-1 bg-border" />
+                </div>
+              )}
             </div>
-            <div className="flex items-center gap-4">
-              <label htmlFor="password-input" className="text-sm font-medium w-16 shrink-0">
-                {t('login.password')}
-              </label>
-              <Input
-                id="password-input"
-                type="password"
-                placeholder={t('login.passwordPlaceholder')}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                className="h-11 flex-1"
-              />
-            </div>
-            <Button
-              type="submit"
-              className="w-full h-11 text-base font-medium mt-2"
-              disabled={loading}
-            >
-              {loading ? t('login.loggingIn') : t('login.loginButton')}
-            </Button>
-          </form>
+          )}
+          {!passwordLoginEnabled && ssoEnabled ? null : (
+            <form onSubmit={handleSubmit} className="space-y-6">
+              <div className="flex items-center gap-4">
+                <label htmlFor="username-input" className="text-sm font-medium w-16 shrink-0">
+                  {t('login.username')}
+                </label>
+                <Input
+                  id="username-input"
+                  placeholder={t('login.usernamePlaceholder')}
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  required
+                  className="h-11 flex-1"
+                />
+              </div>
+              <div className="flex items-center gap-4">
+                <label htmlFor="password-input" className="text-sm font-medium w-16 shrink-0">
+                  {t('login.password')}
+                </label>
+                <Input
+                  id="password-input"
+                  type="password"
+                  placeholder={t('login.passwordPlaceholder')}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                  className="h-11 flex-1"
+                />
+              </div>
+              <Button
+                type="submit"
+                className="w-full h-11 text-base font-medium mt-2"
+                disabled={loading}
+              >
+                {loading ? t('login.loggingIn') : t('login.loginButton')}
+              </Button>
+            </form>
+          )}
         </CardContent>
       </Card>
     </div>

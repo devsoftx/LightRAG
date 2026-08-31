@@ -31,7 +31,9 @@
     "errorEmptyFields": "ユーザー名とパスワードを入力してください",
     "errorInvalidCredentials": "ログインに失敗しました。ユーザー名とパスワードを確認してください",
     "authDisabled": "認証が無効になっています。ログインフリーモードを使用しています。",
-    "guestMode": "ログインフリー"
+    "guestMode": "ログインフリー",
+    "ssoButton": "Microsoft でサインイン",
+    "or": "または"
   },
   "common": {
     "cancel": "キャンセル",
