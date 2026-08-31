@@ -124,3 +124,58 @@ def test_fingerprint_does_not_disclose_group_names():
 def test_fingerprint_cannot_collide_across_boundaries():
     """('a','bc') and ('ab','c') must not hash alike."""
     assert acl_fingerprint(("a", "bc")) != acl_fingerprint(("ab", "c"))
+
+
+# --------------------------------------------------------------------------
+# Startup guard: RLS is a PostgreSQL-only feature
+# --------------------------------------------------------------------------
+
+
+def _storage_args(**overrides):
+    import argparse
+
+    base = dict(
+        postgres_rls_enabled=False,
+        kv_storage="JsonKVStorage",
+        vector_storage="NanoVectorDBStorage",
+        doc_status_storage="JsonDocStatusStorage",
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_rls_disabled_permits_any_backend():
+    from lightrag.api.config import validate_rls_configuration
+
+    validate_rls_configuration(_storage_args())
+
+
+def test_rls_enabled_rejects_file_based_backends():
+    """A silently-ignored access-control switch is worse than an absent one."""
+    from lightrag.api.config import validate_rls_configuration
+
+    with pytest.raises(ValueError, match="PostgreSQL storage backends"):
+        validate_rls_configuration(_storage_args(postgres_rls_enabled=True))
+
+
+def test_rls_enabled_rejects_partial_postgres():
+    """PG vectors but a JSON KV store still leaves content unfiltered."""
+    from lightrag.api.config import validate_rls_configuration
+
+    with pytest.raises(ValueError, match="kv_storage"):
+        validate_rls_configuration(
+            _storage_args(postgres_rls_enabled=True, vector_storage="PGVectorStorage")
+        )
+
+
+def test_rls_enabled_accepts_full_postgres():
+    from lightrag.api.config import validate_rls_configuration
+
+    validate_rls_configuration(
+        _storage_args(
+            postgres_rls_enabled=True,
+            kv_storage="PGKVStorage",
+            vector_storage="PGVectorStorage",
+            doc_status_storage="PGDocStatusStorage",
+        )
+    )

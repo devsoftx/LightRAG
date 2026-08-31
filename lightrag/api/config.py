@@ -215,6 +215,48 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
         )
 
 
+#: Storage backends that can enforce PostgreSQL Row-Level Security. The graph
+#: backends are deliberately absent: graph ACLs are unresolved (see
+#: docs/TODO.md), so a PG graph store does not make RLS meaningful on its own.
+_RLS_CAPABLE_STORAGES = {
+    "kv_storage": {"PGKVStorage"},
+    "vector_storage": {"PGVectorStorage"},
+    "doc_status_storage": {"PGDocStatusStorage"},
+}
+
+
+def validate_rls_configuration(args: argparse.Namespace) -> None:
+    """Refuse to start when RLS is requested but cannot possibly be enforced.
+
+    ``POSTGRES_RLS_ENABLED`` binds the caller's identity to the PostgreSQL
+    session so row-level policies can filter. That mechanism lives entirely in
+    ``lightrag.kg.postgres_impl``: with a file-based or non-PostgreSQL backend
+    the flag is read, no policy exists, and every row is returned as before.
+
+    Failing closed at startup is the point. A silently-ignored access-control
+    switch is worse than an absent one, because an operator who set it believes
+    filtering is active. Nothing in the query results distinguishes the two.
+    """
+    if not getattr(args, "postgres_rls_enabled", False):
+        return
+
+    offenders = []
+    for attr, allowed in _RLS_CAPABLE_STORAGES.items():
+        configured = getattr(args, attr, None)
+        if configured and configured not in allowed:
+            offenders.append(f"{attr}={configured} (needs one of {sorted(allowed)})")
+
+    if offenders:
+        raise ValueError(
+            "POSTGRES_RLS_ENABLED=true requires PostgreSQL storage backends for "
+            "every store that holds retrievable content, because Row-Level "
+            "Security is enforced by PostgreSQL and by nothing else. "
+            "Misconfigured: " + "; ".join(offenders) + ". "
+            "Either switch these to their PG* implementations or set "
+            "POSTGRES_RLS_ENABLED=false."
+        )
+
+
 def validate_scan_batch_configuration(args: argparse.Namespace) -> None:
     """Reject a non-positive scan enqueue batch size (LR2 §8.2/§11).
 
@@ -904,6 +946,13 @@ def parse_args() -> argparse.Namespace:
     # Where the browser lands after a successful callback.
     args.sso_post_login_redirect = get_env_value("SSO_POST_LOGIN_REDIRECT", "/webui/")
 
+    # PostgreSQL Row-Level Security. Enforced by PostgreSQL and nothing else,
+    # hence the POSTGRES_ prefix: with any other backend the flag would be read
+    # and silently do nothing. validate_rls_configuration refuses to start in
+    # that case rather than let an operator believe filtering is active.
+    args.postgres_rls_enabled = get_env_value("POSTGRES_RLS_ENABLED", False, bool)
+    args.postgres_rls_work_mem = get_env_value("POSTGRES_RLS_WORK_MEM", "")
+
     # Rerank model configuration
     args.rerank_model = get_env_value("RERANK_MODEL", None)
     args.rerank_binding_host = get_env_value("RERANK_BINDING_HOST", None)
@@ -1002,6 +1051,7 @@ def parse_args() -> argparse.Namespace:
 
     validate_auth_configuration(args)
     validate_bedrock_auth_configuration(args)
+    validate_rls_configuration(args)
     return args
 
 
@@ -1058,6 +1108,7 @@ def initialize_config(args=None, force=False):
     validate_bedrock_auth_configuration(resolved_args)
     validate_scan_batch_configuration(resolved_args)
     validate_admission_configuration(resolved_args)
+    validate_rls_configuration(resolved_args)
     _global_args = resolved_args
     _initialized = True
     return _global_args
