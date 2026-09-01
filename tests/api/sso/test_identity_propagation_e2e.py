@@ -85,9 +85,7 @@ def test_groups_are_normalized_end_to_end(app_and_client):
     _, client = app_and_client
     token = _token("bob@corp.com", ["Sec-B", "Sec-A", "Sec-B", "   "])
 
-    body = client.get(
-        "/probe", headers={"Authorization": f"Bearer {token}"}
-    ).json()
+    body = client.get("/probe", headers={"Authorization": f"Bearer {token}"}).json()
     assert body["groups"] == ["Sec-A", "Sec-B"]
 
 
@@ -96,9 +94,7 @@ def test_token_without_groups_is_authenticated_with_none(app_and_client):
     _, client = app_and_client
     token = _token("carol@corp.com", groups=None)
 
-    body = client.get(
-        "/probe", headers={"Authorization": f"Bearer {token}"}
-    ).json()
+    body = client.get("/probe", headers={"Authorization": f"Bearer {token}"}).json()
     assert body["identity_established"] is True
     assert body["groups"] == []
 
