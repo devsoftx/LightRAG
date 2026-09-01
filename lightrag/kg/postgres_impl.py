@@ -9,7 +9,11 @@ from datetime import timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, ClassVar, Sequence, TypeVar, Union, final
 
-from lightrag.security_context import get_user_groups, to_pg_text_array
+from lightrag.security_context import (
+    get_user_groups,
+    is_user_request,
+    to_pg_text_array,
+)
 
 import numpy as np
 import configparser
@@ -889,13 +893,22 @@ class PostgreSQLDB:
         never carry one caller's entitlements into another's request. Security
         stops depending on the reset callback.
         """
+        if not is_user_request():
+            # Internal work -- the ingestion pipeline, migrations, maintenance.
+            # These legitimately have no end user to scope to, and several of
+            # them call the very same storage methods that serve requests, so
+            # refusing here would stop ingestion outright. The marker is set
+            # only by the API layer, so this branch cannot be reached by a
+            # request that merely lost its groups.
+            return await operation(connection)
+
         groups = get_user_groups()
         if groups is None:
-            # No identity was established for this task. Refuse rather than run:
-            # an unscoped query would silently return every row, which is the
-            # one failure mode invisible in the results. Distinct from an
-            # authenticated caller with zero groups, which proceeds and simply
-            # matches little.
+            # A user request that reached here without an identity. Refuse
+            # rather than run: an unscoped query would silently return every
+            # row, which is the one failure mode invisible in the results.
+            # Distinct from an authenticated caller with zero groups, which
+            # proceeds below and simply matches little.
             raise PermissionError(
                 "RLS-scoped database operation attempted with no identity in "
                 "context. This is a bug in the calling path, not a permission "
@@ -2731,6 +2744,7 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
         timing_label: str | None = None,
+        rls_context: bool = False,
     ) -> dict[str, Any] | None | list[dict[str, Any]]:
         async def _operation(connection: asyncpg.Connection) -> Any:
             prepared_params = tuple(params) if params else ()
@@ -2792,6 +2806,7 @@ class PostgreSQLDB:
                 with_age=with_age,
                 graph_name=graph_name,
                 timing_label=timing_label,
+                rls_context=rls_context,
             )
         except Exception as e:
             logger.error(f"PostgreSQL database, error:{e}")
@@ -3171,7 +3186,11 @@ class PGKVStorage(BaseKVStorage):
         """Get data by id."""
         sql = SQL_TEMPLATES["get_by_id_" + self.namespace]
         params = {"workspace": self.workspace, "id": id}
-        response = await self.db.query(sql, list(params.values()))
+        response = await self.db.query(
+            sql,
+            list(params.values()),
+            rls_context=True,
+        )
 
         if response and is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
             # Parse llm_cache_list JSON string back to list
@@ -3329,7 +3348,12 @@ class PGKVStorage(BaseKVStorage):
 
         sql = SQL_TEMPLATES["get_by_ids_" + self.namespace]
         params = {"workspace": self.workspace, "ids": ids}
-        results = await self.db.query(sql, list(params.values()), multirows=True)
+        results = await self.db.query(
+            sql,
+            list(params.values()),
+            multirows=True,
+            rls_context=True,
+        )
 
         def _order_results(
             rows: list[dict[str, Any]] | None,
@@ -4903,7 +4927,12 @@ class PGVectorStorage(BaseVectorStorage):
             "top_k": top_k,
             "embedding": embedding,
         }
-        results = await self.db.query(sql, params=list(params.values()), multirows=True)
+        # The only read that feeds retrieved context to the model, and so the
+        # one that must be filtered by the caller's entitlements. Inert unless
+        # POSTGRES_RLS_ENABLED is set; see PostgreSQLDB._run_with_rls_context.
+        results = await self.db.query(
+            sql, params=list(params.values()), multirows=True, rls_context=True
+        )
         return results
 
     async def index_done_callback(self) -> None:
@@ -5123,7 +5152,11 @@ class PGVectorStorage(BaseVectorStorage):
             f"FROM {self.table_name} WHERE workspace=$1 AND id=$2"
         )
         try:
-            result = await self.db.query(query, [self.workspace, id])
+            result = await self.db.query(
+                query,
+                [self.workspace, id],
+                rls_context=True,
+            )
             if result:
                 row = dict(result)
                 # Drop the embedding column: it is a numpy array (pgvector
@@ -5179,7 +5212,10 @@ class PGVectorStorage(BaseVectorStorage):
             )
             try:
                 results = await self.db.query(
-                    query, [self.workspace, remaining], multirows=True
+                    query,
+                    [self.workspace, remaining],
+                    multirows=True,
+                    rls_context=True,
                 )
                 for record in results or []:
                     if record is None:
@@ -5297,7 +5333,10 @@ class PGVectorStorage(BaseVectorStorage):
         )
         try:
             results = await self.db.query(
-                query, [self.workspace, remaining], multirows=True
+                query,
+                [self.workspace, remaining],
+                multirows=True,
+                rls_context=True,
             )
             for row in results or []:
                 if not row or "content_vector" not in row or "id" not in row:
@@ -5546,7 +5585,12 @@ class PGDocStatusStorage(DocStatusStorage):
     async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and id=$2"
         params = {"workspace": self.workspace, "id": id}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            rls_context=True,
+        )
         if result is None or result == []:
             return None
         else:
@@ -5593,7 +5637,12 @@ class PGDocStatusStorage(DocStatusStorage):
         sql = "SELECT * FROM LIGHTRAG_DOC_STATUS WHERE workspace=$1 AND id = ANY($2)"
         params = {"workspace": self.workspace, "ids": ids}
 
-        results = await self.db.query(sql, list(params.values()), True)
+        results = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            rls_context=True,
+        )
 
         if not results:
             return []
@@ -5653,7 +5702,12 @@ class PGDocStatusStorage(DocStatusStorage):
         """
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and file_path=$2"
         params = {"workspace": self.workspace, "file_path": file_path}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            rls_context=True,
+        )
 
         if result is None or result == []:
             return None
@@ -5729,7 +5783,12 @@ class PGDocStatusStorage(DocStatusStorage):
         )
         params = [self.workspace, basename]
 
-        result = await self.db.query(sql, params, True)
+        result = await self.db.query(
+            sql,
+            params,
+            True,
+            rls_context=True,
+        )
         if not result:
             return None
         row = result[0]
@@ -5807,7 +5866,12 @@ class PGDocStatusStorage(DocStatusStorage):
             f"WHERE workspace=$1 AND content_hash=$2{exclude_clause} "
             "ORDER BY created_at ASC, id ASC LIMIT 1"
         )
-        result = await self.db.query(sql, params, True)
+        result = await self.db.query(
+            sql,
+            params,
+            True,
+            rls_context=True,
+        )
         if not result:
             return None
         row = result[0]
@@ -6239,7 +6303,15 @@ class PGDocStatusStorage(DocStatusStorage):
             "metadata FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace=$1 AND id = ANY($2)"
         )
-        rows = await self.db.query(sql, [self.workspace, ids], multirows=True) or []
+        rows = (
+            await self.db.query(
+                sql,
+                [self.workspace, ids],
+                multirows=True,
+                rls_context=True,
+            )
+            or []
+        )
         result: dict[str, DocSchedulingRecord] = {}
         for row in rows:
             record = self._pg_scheduling_record_from_row(row, strict=strict)
@@ -6271,7 +6343,15 @@ class PGDocStatusStorage(DocStatusStorage):
         if not ids:
             return {}
         sql = "SELECT * FROM LIGHTRAG_DOC_STATUS WHERE workspace=$1 AND id = ANY($2)"
-        rows = await self.db.query(sql, [self.workspace, ids], multirows=True) or []
+        rows = (
+            await self.db.query(
+                sql,
+                [self.workspace, ids],
+                multirows=True,
+                rls_context=True,
+            )
+            or []
+        )
         result: dict[str, DocProcessingStatus] = {}
         for element in rows:
             try:
@@ -6345,7 +6425,15 @@ class PGDocStatusStorage(DocStatusStorage):
             " GROUP BY file_path HAVING COUNT(*) >= 2 "
             f"ORDER BY file_path ASC LIMIT ${len(params)}"
         )
-        rows = await self.db.query(sql, params, multirows=True) or []
+        rows = (
+            await self.db.query(
+                sql,
+                params,
+                multirows=True,
+                rls_context=True,
+            )
+            or []
+        )
 
         conflicts: list[SourceConflictSummary] = []
         for row in rows:
@@ -6357,6 +6445,7 @@ class PGDocStatusStorage(DocStatusStorage):
                     "ORDER BY id ASC LIMIT $3",
                     [self.workspace, key, self._CONFLICT_SAMPLE_CAP],
                     multirows=True,
+                    rls_context=True,
                 )
                 or []
             )
@@ -6477,7 +6566,12 @@ class PGDocStatusStorage(DocStatusStorage):
                   where workspace=$1 GROUP BY STATUS
                  """
         params = {"workspace": self.workspace}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            rls_context=True,
+        )
         counts = {}
         for doc in result:
             counts[doc["status"]] = doc["count"]
@@ -6489,7 +6583,12 @@ class PGDocStatusStorage(DocStatusStorage):
         """all documents with a specific status"""
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and status=$2"
         params = {"workspace": self.workspace, "status": status.value}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            rls_context=True,
+        )
 
         docs_by_status = {}
         for element in result:
@@ -6627,7 +6726,12 @@ class PGDocStatusStorage(DocStatusStorage):
         """Get all documents with a specific track_id"""
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and track_id=$2"
         params = {"workspace": self.workspace, "track_id": track_id}
-        result = await self.db.query(sql, list(params.values()), True)
+        result = await self.db.query(
+            sql,
+            list(params.values()),
+            True,
+            rls_context=True,
+        )
 
         docs_by_track_id = {}
         for element in result or []:
@@ -6769,11 +6873,18 @@ class PGDocStatusStorage(DocStatusStorage):
             ORDER BY p.{sort_field} {sort_direction.upper()} NULLS LAST
         """
         query_timing_label = f"{self.workspace} PGDocStatusStorage.get_docs_paginated"
+        # The user-facing document listing (WebUI Documents tab, GET
+        # /documents/paginated), so it is scoped to the caller's entitlements:
+        # a user must not see rows for documents they cannot read, and the
+        # total count must not reveal how many exist beyond their reach.
+        # Inert for pipeline calls, which are not marked as user requests and
+        # run unscoped -- see PostgreSQLDB._run_with_rls_context.
         result = await self.db.query(
             cte_sql,
             list(params.values()),
             True,
             timing_label=query_timing_label,
+            rls_context=True,
         )
         total_count = result[0]["_total_count"] if result else 0
 
@@ -6855,6 +6966,7 @@ class PGDocStatusStorage(DocStatusStorage):
             list(params.values()),
             True,
             timing_label=query_timing_label,
+            rls_context=True,
         )
 
         counts = {}

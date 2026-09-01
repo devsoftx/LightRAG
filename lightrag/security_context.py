@@ -43,6 +43,29 @@ _current_user_groups: ContextVar[tuple[str, ...] | None] = ContextVar(
 )
 
 
+# Whether the current task is serving an authenticated end-user request, as
+# opposed to internal work (the ingestion pipeline, migrations, maintenance).
+#
+# This is NOT derivable from the group set. Both an internal task and a
+# hypothetical mis-wired request would show no groups, and the two must be
+# treated in opposite ways: internal work legitimately runs unscoped, while a
+# request that lost its identity must be refused. A separate, explicitly-set
+# marker keeps "unscoped" impossible to reach by accident -- it is only ever
+# true when nothing set it, and only the API layer sets it.
+_is_user_request: ContextVar[bool] = ContextVar(
+    "lightrag_is_user_request", default=False
+)
+
+
+def mark_user_request() -> object:
+    """Mark this task as serving an authenticated end-user request."""
+    return _is_user_request.set(True)
+
+
+def is_user_request() -> bool:
+    return _is_user_request.get()
+
+
 def set_user_groups(groups: Iterable[str] | None) -> object:
     """Establish the caller's group set for this task.
 

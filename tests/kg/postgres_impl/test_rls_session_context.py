@@ -7,6 +7,11 @@ live server:
    silent no-op and plain ``SET`` would persist onto the pooled connection);
 2. the group array is passed as a BIND PARAMETER, never interpolated;
 3. a missing identity REFUSES rather than running an unscoped query.
+
+A user request is simulated with ``mark_user_request()``: the identity binding
+is deliberately skipped for INTERNAL work (the ingestion pipeline, migrations),
+which shares these storage methods and has no end user to scope to. Without the
+marker these tests would exercise the internal path and assert nothing.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ from __future__ import annotations
 import pytest
 
 from lightrag.kg.postgres_impl import PostgreSQLDB
-from lightrag.security_context import user_groups_scope
+from lightrag.security_context import mark_user_request, user_groups_scope
 
 
 class _FakeTransaction:
@@ -45,6 +50,16 @@ class _FakeConnection:
     async def fetch(self, sql, *params):
         self.log.append((sql, params))
         return []
+
+
+@pytest.fixture(autouse=True)
+def _as_user_request():
+    """These tests exercise the USER-REQUEST path, which the API layer marks."""
+    token = mark_user_request()
+    yield
+    from lightrag.security_context import _is_user_request
+
+    _is_user_request.reset(token)
 
 
 def _db(rls_enabled=True, work_mem=None) -> PostgreSQLDB:

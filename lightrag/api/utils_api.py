@@ -21,7 +21,7 @@ from fastapi import HTTPException, Security, Request, Response, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
 from ..utils import safe_log_value
-from ..security_context import set_user_groups
+from ..security_context import mark_user_request, set_user_groups
 from .auth import auth_handler
 from .config import (
     ollama_server_infos,
@@ -508,6 +508,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     # endpoint, so the value is visible for the whole request and
                     # dies with the task. Deliberately not reset here -- an
                     # explicit reset would unbind it before the endpoint runs.
+                    mark_user_request()
                     set_user_groups(_groups_from_token(token_info))
                     _renew_token_if_needed(path, response, token_info)
                     return

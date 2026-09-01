@@ -56,6 +56,17 @@ neo4jWorkDir/
 inputs/
 output/
 rag_storage/
+# Timestamped snapshots taken when switching storage backends
+# (e.g. rag_storage.filebacked-20260830-210520/). These are working data, often
+# tens of MB, and must never reach the repository.
+rag_storage.*/
+
+# .env snapshots. The bare ".env" rule above does NOT cover these, and they
+# contain every secret .env holds -- an .env.backup-* was committed once and
+# only caught by GitHub push protection (Azure AD application secret).
+.env.backup*
+.env.*.bak
+.env.save
 data/
 
 # User cumstomized prompt directory
@@ -67,6 +78,10 @@ lightrag/evaluation/results/
 # Miscellaneous
 .DS_Store
 TODO.md
+# ...but docs/TODO.md is a tracked project document (deferred RLS work), not a
+# personal scratch note. The bare pattern above matches at any depth, so it has
+# to be re-included explicitly.
+!docs/TODO.md
 ignore_this.txt
 *.ignore.*
 

@@ -65,17 +65,37 @@ class EntraProvider:
             or subject
         ).strip()
 
-        # Entra emits 'groups' only when the app registration requests the
-        # groups claim. Above the token-size limit it substitutes
-        # '_claim_names'/'_claim_sources' (the Graph overage indicator) and
-        # omits 'groups' entirely -- so an unconfigured or overflowing app
-        # yields no groups, and any SSO_ALLOWED_GROUPS check will correctly
-        # deny rather than silently admit. 'roles' (app roles) is accepted as
-        # an equivalent, and is the recommended shape for large directories.
-        raw_groups = claims.get("groups") or claims.get("roles") or []
-        if isinstance(raw_groups, str):
-            raw_groups = [raw_groups]
-        groups = tuple(str(g).strip() for g in raw_groups if str(g).strip())
+        # Entitlements are the UNION of app roles and group memberships, not a
+        # choice between them. Preferring one claim over the other silently
+        # drops half a user's access when both are configured -- and because
+        # 'groups' emits opaque object IDs while 'roles' emits the string
+        # values chosen on the app registration, picking 'groups' first would
+        # shadow readable role names with GUIDs that match no ACL.
+        #
+        # Claim availability differs sharply between the two:
+        #
+        # - 'roles' appears only for app roles ASSIGNED to this user under
+        #   Enterprise applications > Users and groups. Defining a role is not
+        #   enough. Values are whatever the registration declares, so ACLs can
+        #   read 'Sec-Fin-Admins' rather than a GUID, and they do not overflow.
+        # - 'groups' appears only when the registration requests it under Token
+        #   configuration, per token type -- it must be enabled for the ID
+        #   token, which is what is verified here. Above the token size limit
+        #   Entra substitutes '_claim_names'/'_claim_sources' (the Graph
+        #   overage indicator) and omits 'groups' entirely.
+        #
+        # Either way an unconfigured or overflowing app yields nothing, so an
+        # SSO_ALLOWED_GROUPS check correctly denies rather than silently
+        # admitting.
+        collected: list[str] = []
+        for claim_name in ("roles", "groups"):
+            raw = claims.get(claim_name) or []
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, (list, tuple)):
+                collected.extend(str(g).strip() for g in raw if str(g).strip())
+        # De-duplicated but order-insensitive; set_user_groups sorts downstream.
+        groups = tuple(dict.fromkeys(collected))
 
         return IdentityClaims(
             subject=subject, username=username, groups=groups, raw=dict(claims)

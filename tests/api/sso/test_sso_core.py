@@ -153,3 +153,82 @@ def test_role_mapping_applied():
     plain = IdentityClaims(subject="s", username="u", groups=("everyone",))
     assert flow._authorize(admin) == "admin"
     assert flow._authorize(plain) == "user"
+
+
+# --------------------------------------------------------------------------
+# Entra claim mapping: app roles and groups are additive
+# --------------------------------------------------------------------------
+
+
+def _entra():
+    from lightrag.api.sso.providers.entra import EntraProvider
+
+    return EntraProvider()
+
+
+def test_app_roles_are_read_from_the_roles_claim():
+    """App roles carry the string values chosen on the registration."""
+    ident = _entra().map_claims(
+        {"oid": "o1", "preferred_username": "a@b.c", "roles": ["Sec-Fin-Admins"]}
+    )
+    assert ident.groups == ("Sec-Fin-Admins",)
+
+
+def test_roles_and_groups_are_unioned_not_chosen_between():
+    """Preferring one claim would silently drop half a user's entitlements."""
+    ident = _entra().map_claims(
+        {
+            "oid": "o1",
+            "preferred_username": "a@b.c",
+            "roles": ["Sec-Fin-Admins"],
+            "groups": ["8f4a1e2c-0000-0000-0000-000000000001"],
+        }
+    )
+    assert set(ident.groups) == {
+        "Sec-Fin-Admins",
+        "8f4a1e2c-0000-0000-0000-000000000001",
+    }
+
+
+def test_role_names_are_not_shadowed_by_group_guids():
+    """The readable value must survive when both claims are present."""
+    ident = _entra().map_claims(
+        {
+            "oid": "o1",
+            "preferred_username": "a@b.c",
+            "groups": ["8f4a1e2c-0000-0000-0000-000000000001"],
+            "roles": ["Sec-HR-General"],
+        }
+    )
+    assert "Sec-HR-General" in ident.groups
+
+
+def test_no_claim_yields_no_entitlement():
+    """An unconfigured app must deny, not admit."""
+    ident = _entra().map_claims({"oid": "o1", "preferred_username": "a@b.c"})
+    assert ident.groups == ()
+
+
+def test_overage_indicator_yields_no_entitlement():
+    """Above the token size limit Entra omits 'groups' entirely."""
+    ident = _entra().map_claims(
+        {
+            "oid": "o1",
+            "preferred_username": "a@b.c",
+            "_claim_names": {"groups": "src1"},
+            "_claim_sources": {"src1": {"endpoint": "https://graph..."}},
+        }
+    )
+    assert ident.groups == ()
+
+
+def test_duplicates_across_claims_are_collapsed():
+    ident = _entra().map_claims(
+        {
+            "oid": "o1",
+            "preferred_username": "a@b.c",
+            "roles": ["Sec-Fin-Admins"],
+            "groups": ["Sec-Fin-Admins"],
+        }
+    )
+    assert ident.groups == ("Sec-Fin-Admins",)

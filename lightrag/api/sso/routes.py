@@ -148,6 +148,33 @@ def create_sso_router(args, auth_handler, *, login_rate_limiter=None) -> APIRout
         )
         logger.info("[sso] sign-in succeeded for %r role=%s", identity.username, role)
 
+        # Diagnostic for the most common SSO misconfiguration: the identity
+        # provider authenticates the user but sends no group/role claim, so
+        # every caller arrives entitled to nothing and sees only public rows.
+        # That looks identical to "this user has no groups", which is why the
+        # claim NAMES are reported -- their absence is the finding. Names only,
+        # never values: claims carry personal data and group identifiers.
+        if not identity.groups:
+            present = sorted(identity.raw.keys())
+            logger.warning(
+                "[sso] %r arrived with NO group/role claim. Claims present in the "
+                "id_token: %s. Entra emits 'groups' only when the app registration "
+                "requests it under Token configuration (and separately per token "
+                "type -- it must be enabled for the ID token, not only the access "
+                "token), and emits 'roles' only for app roles ASSIGNED to this user "
+                "under Enterprise applications > Users and groups. Above the token "
+                "size limit 'groups' is replaced by '_claim_names'/'_claim_sources' "
+                "and omitted entirely.",
+                identity.username,
+                present,
+            )
+        else:
+            logger.info(
+                "[sso] %r carries %d group/role value(s)",
+                identity.username,
+                len(identity.groups),
+            )
+
         destination = return_to or settings.post_login_redirect
         # The token rides in the URL fragment: fragments are never sent to a
         # server, so it stays out of access logs and Referer headers -- unlike a
