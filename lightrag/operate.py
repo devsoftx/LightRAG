@@ -75,6 +75,7 @@ from lightrag.chunk_schema import (
     strip_internal_multimodal_markup_for_extraction,
 )
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
+from lightrag.security_context import acl_fingerprint, get_user_groups
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -4391,13 +4392,28 @@ async def extract_entities(
 # text filed under a history-blind key, and entries record no history, so a
 # tainted entry cannot be told apart from a clean one. Only the answer cache is
 # versioned; keyword/extract/summary entries never see conversation_history.
-_ANSWER_CACHE_POLICY_VERSION = "query-answer-cache-v2"
+_ANSWER_CACHE_POLICY_VERSION = "query-answer-cache-v3-acl"
 
 
 def _answer_cache_kv(
     query_param: QueryParam, hashing_kv: BaseKVStorage | None
 ) -> BaseKVStorage | None:
     """Return the storage backing the query-answer cache, or None to bypass it.
+
+    **Sharing is bounded by entitlement.** The key includes an
+    :func:`~lightrag.security_context.acl_fingerprint` of the caller's group
+    set, so an entry is reused only by callers holding the same entitlements.
+    This is not an optimisation detail: the cache sits in FRONT of the database,
+    so a hit never reaches PostgreSQL and no Row-Level Security policy is
+    evaluated. Keyed without it, every RLS policy would be correct and still
+    bypassed on any repeated question -- and undetectably so, since an
+    ``EXPLAIN`` of a query that never ran proves nothing.
+
+    Callers with no established identity share one partition, which reproduces
+    the previous behaviour exactly for deployments that do not authenticate.
+    The cost of partitioning is a lower hit rate where several distinct group
+    sets ask the same question; that is deliberate, and cheaper than making
+    cache correctness depend on RLS being configured.
 
     The answer cache key deliberately excludes ``conversation_history``: every
     turn of a conversation carries a different history, so keying on it would
@@ -4564,6 +4580,11 @@ async def kg_query(
     answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
     args_hash = compute_args_hash(
         _ANSWER_CACHE_POLICY_VERSION,
+        # Partition by the caller's entitlements. Without this the cache sits in
+        # FRONT of every access-control decision: a hit never reaches the
+        # database, so no RLS policy is evaluated and a caller can be served an
+        # answer synthesized from documents they cannot read.
+        acl_fingerprint(get_user_groups()),
         query_param.mode,
         query,
         query_param.response_type,
@@ -6574,6 +6595,11 @@ async def naive_query(
     answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
     args_hash = compute_args_hash(
         _ANSWER_CACHE_POLICY_VERSION,
+        # Partition by the caller's entitlements. Without this the cache sits in
+        # FRONT of every access-control decision: a hit never reaches the
+        # database, so no RLS policy is evaluated and a caller can be served an
+        # answer synthesized from documents they cannot read.
+        acl_fingerprint(get_user_groups()),
         query_param.mode,
         query,
         query_param.response_type,

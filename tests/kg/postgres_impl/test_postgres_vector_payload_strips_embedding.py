@@ -39,7 +39,9 @@ def _make_storage(row):
         ),
     )
 
-    async def _query(sql, params, multirows=False):
+    # **kwargs so the double keeps matching PostgreSQLDB.query as it grows --
+    # it now also takes rls_context, which this test does not exercise.
+    async def _query(sql, params, multirows=False, **kwargs):
         return [row] if multirows else row
 
     storage.db = AsyncMock()
